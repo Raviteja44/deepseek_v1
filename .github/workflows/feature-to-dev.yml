@@ -24,6 +24,11 @@ jobs:
           fetch-depth: 0
           ref: dev
 
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Validate feature branch exists
         id: validate-branch
         run: |
@@ -87,19 +92,22 @@ jobs:
         run: |
           FEATURE_BRANCH="${{ steps.validate-branch.outputs.branch_name }}"
           
-          git checkout -b test-merge dev
-          git merge --no-commit --no-ff "origin/$FEATURE_BRANCH"
+          # Create test merge branch
+          git checkout -b test-merge-branch dev
           
-          if [ $? -ne 0 ]; then
+          # Try to merge feature branch into test branch
+          if git merge --no-commit --no-ff "origin/$FEATURE_BRANCH" 2>&1 | grep -q "CONFLICT"; then
             echo "Merge conflicts detected. Please resolve conflicts between dev and $FEATURE_BRANCH"
             git merge --abort
             exit 1
           else
+            echo "No merge conflicts detected"
             git merge --abort
           fi
           
+          # Clean up
           git checkout dev
-          git branch -D test-merge
+          git branch -D test-merge-branch
 
       - name: Create PR from feature branch to dev
         id: create-pr
