@@ -1,4 +1,4 @@
-name: 3. Promote Dev → UAT
+name: 2. Promote Dev → UAT
 
 on:
   workflow_dispatch:
@@ -145,8 +145,9 @@ jobs:
           
           echo "Parent commit (dev before PR): $PARENT_DEV"
           
-          # Get the diff between parent and merge commit (this is what we'll apply)
-          echo "Getting diff between $PARENT_DEV and $MERGE_COMMIT..."
+          # Get the second parent (feature branch tip)
+          FEATURE_PARENT=$(echo "$PARENT_COMMITS" | awk '{print $2}')
+          echo "Feature branch parent: $FEATURE_PARENT"
           
           # Get changed files
           CHANGED_FILES=$(git diff --name-only "$PARENT_DEV" "$MERGE_COMMIT")
@@ -165,16 +166,26 @@ jobs:
           echo "commit_count=$COMMIT_COUNT" >> $GITHUB_ENV
           
           echo "parent_commit=$PARENT_DEV" >> $GITHUB_OUTPUT
+          echo "feature_parent=$FEATURE_PARENT" >> $GITHUB_OUTPUT
           
-          # Create a patch file with the changes
-          git diff "$PARENT_DEV" "$MERGE_COMMIT" --no-prefix > changes.patch
+          # Create a better patch file - get diff between dev parent and feature parent
+          # This gets the actual changes from the feature branch
+          git diff "$PARENT_DEV" "$FEATURE_PARENT" > changes.patch
           
           if [ ! -s changes.patch ]; then
-            echo "Warning: Patch file is empty, no changes to apply"
+            echo "Warning: Patch file is empty, trying alternative diff method"
+            # Try diff between dev parent and merge commit
+            git diff "$PARENT_DEV" "$MERGE_COMMIT" > changes.patch
+          fi
+          
+          if [ ! -s changes.patch ]; then
+            echo "Warning: Patch file is still empty, no changes to apply"
             echo "has_changes=false" >> $GITHUB_ENV
           else
             echo "has_changes=true" >> $GITHUB_ENV
             echo "Created patch file with $(wc -l < changes.patch) lines"
+            echo "Patch file preview (first 10 lines):"
+            head -10 changes.patch
           fi
 
       - name: Check if changes already in UAT
@@ -216,58 +227,127 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "Created branch: $BRANCH"
 
-      - name: Apply changes using git apply
+      - name: Apply changes using simpler method
         id: apply_changes
         run: |
           BR="${{ steps.create_branch.outputs.branch }}"
           PR="${{ github.event.inputs.pr_number }}"
+          PARENT_DEV="${{ steps.get-changes.outputs.parent_commit }}"
+          FEATURE_PARENT="${{ steps.get-changes.outputs.feature_parent }}"
+          MERGE_COMMIT="${{ steps.validate.outputs.merge_commit }}"
           
-          echo "Applying changes from PR #$PR using git apply"
+          echo "Applying changes from PR #$PR"
+          echo "Method 1: Using git checkout to get files from feature branch"
           
-          # Apply the patch
-          if git apply --whitespace=nowarn changes.patch; then
-            echo "✓ Successfully applied changes"
+          # Method 1: Checkout files from feature branch
+          if [ -n "$FEATURE_PARENT" ]; then
+            echo "Checking out files from feature branch commit: $FEATURE_PARENT"
             
-            # Add all changes
-            git add -A
+            # Get list of changed files
+            FILES_TO_COPY=$(git diff --name-only "$PARENT_DEV" "$FEATURE_PARENT")
             
-            # Create a commit with proper message
-            COMMIT_MSG="Promote PR #$PR (${{ env.jira_id }}) to UAT\n\nIncludes changes from merge commit: ${{ steps.validate.outputs.merge_commit }}\nSource: PR #$PR merged into dev"
-            
-            echo -e "$COMMIT_MSG" | git commit -F -
-            
-            echo "changes_applied=true" >> $GITHUB_OUTPUT
-          else
-            echo "✗ Failed to apply changes with git apply"
-            echo "Trying alternative method with git merge-tree..."
-            
-            # Try alternative: Use git merge-tree to create a merge
-            PARENT_DEV="${{ steps.get-changes.outputs.parent_commit }}"
-            MERGE_COMMIT="${{ steps.validate.outputs.merge_commit }}"
-            
-            # Get the common ancestor
-            COMMON_ANCESTOR=$(git merge-base "$PARENT_DEV" "$MERGE_COMMIT")
-            
-            # Create a temporary branch with the changes
-            git checkout -b temp_apply "$COMMON_ANCESTOR"
-            
-            # Cherry-pick the merge commit (as a regular commit)
-            if git cherry-pick -n "$MERGE_COMMIT"; then
-              echo "✓ Successfully cherry-picked merge commit"
+            if [ -n "$FILES_TO_COPY" ]; then
+              echo "Files to copy:"
+              echo "$FILES_TO_COPY"
               
-              # Switch back to our promotion branch and merge
-              git checkout "$BR"
-              git merge --no-ff temp_apply -m "Promote PR #$PR (${{ env.jira_id }}) to UAT"
+              # Copy each file from feature branch
+              for FILE in $FILES_TO_COPY; do
+                echo "Copying: $FILE"
+                git checkout "$FEATURE_PARENT" -- "$FILE" 2>/dev/null || echo "Could not checkout $FILE"
+              done
               
-              echo "changes_applied=true" >> $GITHUB_OUTPUT
+              # Check if we have any changes
+              if git status --porcelain | grep -q "."; then
+                echo "✓ Successfully copied files from feature branch"
+                
+                # Add all changes
+                git add -A
+                
+                # Create a commit with proper message
+                COMMIT_MSG="Promote PR #$PR (${{ env.jira_id }}) to UAT
+                
+                Includes changes from PR #$PR merged into dev
+                Merge commit: $MERGE_COMMIT
+                Feature branch: $FEATURE_PARENT"
+                
+                echo "$COMMIT_MSG" | git commit -F -
+                
+                echo "changes_applied=true" >> $GITHUB_OUTPUT
+                echo "method=checkout" >> $GITHUB_OUTPUT
+              else
+                echo "No changes were applied"
+                echo "changes_applied=false" >> $GITHUB_OUTPUT
+              fi
             else
-              echo "✗ All methods failed to apply changes"
+              echo "No files to copy"
               echo "changes_applied=false" >> $GITHUB_OUTPUT
-              exit 1
             fi
+          else
+            echo "No feature parent found, trying alternative method"
+            echo "changes_applied=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Method 2: If first method failed, try using git format-patch
+          if [ "${{ steps.apply_changes.outputs.changes_applied }}" != "true" ]; then
+            echo "Method 2: Using git format-patch"
             
-            # Clean up
-            git branch -D temp_apply
+            # Create patches for individual commits
+            git format-patch "$PARENT_DEV".."$MERGE_COMMIT" --stdout > commits.patch
+            
+            if [ -s commits.patch ]; then
+              echo "Applying patches..."
+              if git am --whitespace=nowarn < commits.patch; then
+                echo "✓ Successfully applied patches"
+                
+                # Update commit message to be more descriptive
+                git commit --amend -m "Promote PR #$PR (${{ env.jira_id }}) to UAT" -m "Includes changes from PR #$PR merged into dev" -m "Merge commit: $MERGE_COMMIT"
+                
+                echo "changes_applied=true" >> $GITHUB_OUTPUT
+                echo "method=format-patch" >> $GITHUB_OUTPUT
+              else
+                echo "✗ Failed to apply patches with git am"
+                echo "changes_applied=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "No patches generated"
+              echo "changes_applied=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+          
+          # Method 3: If still failed, use simple cherry-pick of feature commits
+          if [ "${{ steps.apply_changes.outputs.changes_applied }}" != "true" ]; then
+            echo "Method 3: Cherry-picking feature commits individually"
+            
+            # Get commits from feature branch (excluding merge commit)
+            FEATURE_COMMITS=$(git log --no-merges --pretty=format:"%H" "$PARENT_DEV".."$MERGE_COMMIT")
+            
+            if [ -n "$FEATURE_COMMITS" ]; then
+              echo "Found feature commits to cherry-pick:"
+              echo "$FEATURE_COMMITS"
+              
+              SUCCESS=true
+              for COMMIT in $FEATURE_COMMITS; do
+                echo "Cherry-picking: $(git log --oneline -n 1 $COMMIT)"
+                if ! git cherry-pick -x "$COMMIT"; then
+                  echo "Failed to cherry-pick $COMMIT"
+                  git cherry-pick --abort
+                  SUCCESS=false
+                  break
+                fi
+              done
+              
+              if [ "$SUCCESS" = "true" ]; then
+                echo "✓ Successfully cherry-picked all feature commits"
+                echo "changes_applied=true" >> $GITHUB_OUTPUT
+                echo "method=cherry-pick" >> $GITHUB_OUTPUT
+              else
+                echo "✗ Failed to cherry-pick feature commits"
+                echo "changes_applied=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "No feature commits found"
+              echo "changes_applied=false" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Push changes if applied successfully
@@ -290,15 +370,17 @@ jobs:
           FILES="${{ env.changed_files }}"
           FILE_COUNT=$(echo "$FILES" | sed '/^\s*$/d' | wc -l | tr -d ' ')
           
+          METHOD="${{ steps.apply_changes.outputs.method }}"
+          
           echo "Automated Promotion PR" > body.txt
           echo "" >> body.txt
           echo "Jira ID: ${JIRA_ID}" >> body.txt
           echo "Source PR: #$PR (merged into dev)" >> body.txt
           echo "Dev Merge Commit: ${{ steps.validate.outputs.merge_commit }}" >> body.txt
           echo "Target branch: uat" >> body.txt
+          echo "Application method: $METHOD" >> body.txt
           echo "" >> body.txt
           echo "Changes identified: $FILE_COUNT files" >> body.txt
-          echo "Method: Applied merge commit diff using git apply" >> body.txt
           echo "" >> body.txt
           
           if [ -n "$FILES" ]; then
