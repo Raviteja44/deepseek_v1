@@ -14,6 +14,4 @@ INSERT INTO test_users VALUES (3, 'P Ravi', 'pravi@example.com');
 
 INSERT INTO test_users VALUES (4, 'P Teja', 'pteja@example.com');
 
---Deleting 1st row
----Adding 1st row
----comments
+--test 1
