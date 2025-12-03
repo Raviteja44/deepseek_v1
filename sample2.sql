@@ -7,7 +7,9 @@ CREATE TABLE test_users (
 );
 
 INSERT INTO test_users VALUES (1, 'John Doe', 'john@example.com');
+INSERT INTO test_users VALUES (2, 'John Doe', 'john@example.com');
 
 
 ---test 1
 --test 2
+--test 3
