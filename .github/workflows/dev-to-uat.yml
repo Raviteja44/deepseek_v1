@@ -136,22 +136,110 @@ jobs:
           git checkout -b "$BRANCH" origin/uat
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
 
-      - name: Apply changes
+      - name: Apply changes with full conflict resolution
         id: apply_changes
         run: |
           if git cherry-pick -x "${{ steps.get-changes.outputs.feature_commit }}"; then
             echo "changes_applied=true" >> $GITHUB_OUTPUT
             echo "conflict_resolved=false" >> $GITHUB_OUTPUT
           else
-            CONFLICTED_FILES=$(git status --porcelain | grep -E '^(UU|AA)' | cut -c4-)
-            for FILE in $CONFLICTED_FILES; do
-              git checkout "${{ steps.get-changes.outputs.feature_commit }}" -- "$FILE" 2>/dev/null && git add "$FILE"
-            done
+            echo "Failed to cherry-pick, analyzing conflict type..."
             
-            if git cherry-pick --continue; then
-              echo "changes_applied=true" >> $GITHUB_OUTPUT
-              echo "conflict_resolved=true" >> $GITHUB_OUTPUT
+            # Get detailed conflict information
+            CONFLICTED_FILES=$(git status --porcelain | grep -E '^(UU|AA|DD|AU|UD|UA|DU)' | cut -c4-)
+            
+            if [ -n "$CONFLICTED_FILES" ]; then
+              echo "Conflicts detected in files:"
+              echo "$CONFLICTED_FILES"
+              
+              # Resolve each conflict based on type
+              RESOLVED=true
+              
+              git status --porcelain | while read line; do
+                STATUS=$(echo "$line" | cut -c1-2)
+                FILE=$(echo "$line" | cut -c4-)
+                
+                echo "Processing: $FILE (status: $STATUS)"
+                
+                case $STATUS in
+                  "UU"|"AA")
+                    # Both modified - use feature branch version
+                    echo "  Both modified conflict - using feature branch version"
+                    git checkout "${{ steps.get-changes.outputs.feature_commit }}" -- "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not checkout $FILE from feature commit"
+                      RESOLVED=false
+                    }
+                    git add "$FILE"
+                    ;;
+                  "DD")
+                    # Both deleted - remove file
+                    echo "  Both deleted - removing file"
+                    git rm "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not remove $FILE"
+                      RESOLVED=false
+                    }
+                    ;;
+                  "AU")
+                    # Added by us, deleted by them - keep our addition
+                    echo "  File added by us, deleted by them - keeping addition"
+                    # Do nothing, keep our version
+                    git add "$FILE"
+                    ;;
+                  "UD")
+                    # Modified by us, deleted by them - delete file
+                    echo "  File modified by us, deleted by them - deleting file"
+                    git rm "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not remove $FILE"
+                      RESOLVED=false
+                    }
+                    ;;
+                  "UA")
+                    # Deleted by us, added by them - add their version
+                    echo "  File deleted by us, added by them - adding their version"
+                    git checkout "${{ steps.get-changes.outputs.feature_commit }}" -- "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not checkout $FILE from feature commit"
+                      RESOLVED=false
+                    }
+                    git add "$FILE"
+                    ;;
+                  "DU")
+                    # Deleted by us, modified by them - SPECIAL CASE: modify/delete conflict
+                    # Since UAT is the target and we're promoting from dev, we should
+                    # accept the modification from dev (feature branch)
+                    echo "  File deleted in UAT, modified in dev - adding modification from dev"
+                    git checkout "${{ steps.get-changes.outputs.feature_commit }}" -- "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not checkout $FILE from feature commit"
+                      RESOLVED=false
+                    }
+                    git add "$FILE"
+                    ;;
+                  *)
+                    echo "  Unknown conflict status: $STATUS"
+                    RESOLVED=false
+                    ;;
+                esac
+              done
+              
+              if [ "$RESOLVED" = "true" ]; then
+                echo "All conflicts resolved, continuing cherry-pick..."
+                if git cherry-pick --continue; then
+                  echo "Successfully resolved conflicts and completed cherry-pick"
+                  echo "changes_applied=true" >> $GITHUB_OUTPUT
+                  echo "conflict_resolved=true" >> $GITHUB_OUTPUT
+                else
+                  echo "Could not continue after conflict resolution"
+                  git cherry-pick --abort
+                  echo "changes_applied=false" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+              else
+                echo "Could not resolve all conflicts, aborting"
+                git cherry-pick --abort
+                echo "changes_applied=false" >> $GITHUB_OUTPUT
+                exit 1
+              fi
             else
+              echo "No conflict markers found, unknown error"
               git cherry-pick --abort
               echo "changes_applied=false" >> $GITHUB_OUTPUT
               exit 1
