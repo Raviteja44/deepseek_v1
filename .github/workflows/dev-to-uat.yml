@@ -69,25 +69,12 @@ jobs:
             exit 1
           fi
 
-          # Get merge commit SHA using the merge_sha field from the PR response
+          # Get merge commit SHA
           MERGE_COMMIT=$(echo "$PR_JSON" | jq -r '.merge_commit_sha')
           
           if [ -z "$MERGE_COMMIT" ] || [ "$MERGE_COMMIT" = "null" ]; then
             echo "Error: Could not get merge commit SHA for PR #$PR"
-            echo "Trying alternative method..."
-            
-            # Alternative: Get the latest commit and check if it's a merge commit
-            LATEST_COMMIT=$(curl -s \
-              -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/commits" \
-              | jq -r '.[-1].sha')
-            
-            if [ -z "$LATEST_COMMIT" ] || [ "$LATEST_COMMIT" = "null" ]; then
-              echo "Error: Could not get any commit SHA for PR #$PR"
-              exit 1
-            fi
-            
-            MERGE_COMMIT="$LATEST_COMMIT"
+            exit 1
           fi
 
           echo "pr_number=$PR" >> $GITHUB_OUTPUT
@@ -133,102 +120,62 @@ jobs:
           echo "Jira ID: $JIRA_ID"
           echo "jira_id=$JIRA_ID" >> $GITHUB_ENV
 
-      - name: Get exact PR changes using merge commit
+      - name: Get changes from merge commit
         id: get-changes
         run: |
           MERGE_COMMIT="${{ steps.validate.outputs.merge_commit }}"
           
           echo "Using merge commit SHA: $MERGE_COMMIT"
           
-          # First, let's verify we can see this commit
-          git show --oneline "$MERGE_COMMIT" || echo "Cannot show commit directly, will try git log"
-          
-          # Get parent commits
-          echo "Getting parent commits for merge commit..."
-          PARENT_COMMITS=$(git log --pretty=%P -n 1 "$MERGE_COMMIT" 2>/dev/null)
+          # Get parent commit (dev before this PR was merged)
+          PARENT_COMMITS=$(git log --pretty=%P -n 1 "$MERGE_COMMIT")
           
           if [ -z "$PARENT_COMMITS" ]; then
-            echo "Warning: Could not get parent commits directly, trying alternative..."
-            # Try to get commit info from git show
-            COMMIT_INFO=$(git show --quiet --pretty="%P" "$MERGE_COMMIT" 2>/dev/null)
-            if [ -n "$COMMIT_INFO" ]; then
-              PARENT_COMMITS="$COMMIT_INFO"
-            else
-              echo "Error: Cannot get parent commits for $MERGE_COMMIT"
-              echo "Available recent commits:"
-              git log --oneline -10
-              exit 1
-            fi
+            echo "Error: Could not get parent commits for merge commit $MERGE_COMMIT"
+            exit 1
           fi
           
-          echo "Parent commits string: $PARENT_COMMITS"
-          
-          # For a merge commit, the first parent is usually the target branch (dev)
+          # For a merge commit, the first parent is the target branch (dev)
           PARENT_DEV=$(echo "$PARENT_COMMITS" | awk '{print $1}')
           
           if [ -z "$PARENT_DEV" ]; then
             echo "Error: Could not extract dev parent from merge commit"
-            echo "Parent commits: $PARENT_COMMITS"
             exit 1
           fi
           
           echo "Parent commit (dev before PR): $PARENT_DEV"
           
-          # Verify the range
-          echo "Checking commits between $PARENT_DEV and $MERGE_COMMIT..."
-          COMMITS=$(git log --no-merges --pretty=format:"%H" "$PARENT_DEV".."$MERGE_COMMIT" 2>/dev/null)
+          # Get the diff between parent and merge commit (this is what we'll apply)
+          echo "Getting diff between $PARENT_DEV and $MERGE_COMMIT..."
           
-          if [ -z "$COMMITS" ]; then
-            echo "No non-merge commits found in this PR range"
-            echo "Checking if this might be a squash merge..."
-            
-            # For squash merges, get the actual commit message
-            MERGE_MESSAGE=$(git log --format="%B" -n 1 "$MERGE_COMMIT")
-            echo "Merge commit message:"
-            echo "$MERGE_MESSAGE"
-            
-            # If squash merge, we might need to handle differently
-            # For now, we'll treat the merge commit itself as the change
-            echo "commits_found=false" >> $GITHUB_ENV
-            echo "Warning: No individual commits found - might be a squash merge"
-            
-            # Get changed files from merge commit
-            CHANGED_FILES=$(git diff --name-only "$PARENT_DEV" "$MERGE_COMMIT")
-            echo "changed_files<<EOF" >> $GITHUB_ENV
-            echo "$CHANGED_FILES" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-            
-            # Get commit message
-            COMMIT_MESSAGE=$(git log --oneline -n 1 "$MERGE_COMMIT")
-            echo "commit_messages<<EOF" >> $GITHUB_ENV
-            echo "$COMMIT_MESSAGE" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-            
-          else
-            COMMIT_COUNT=$(echo "$COMMITS" | wc -l)
-            echo "Found $COMMIT_COUNT commits to promote"
-            echo "commits_found=true" >> $GITHUB_ENV
-            echo "commit_count=$COMMIT_COUNT" >> $GITHUB_ENV
-            
-            # Store commits for cherry-picking
-            echo "commits_list<<EOF" >> $GITHUB_ENV
-            echo "$COMMITS" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-            
-            # Get changed files for PR description
-            CHANGED_FILES=$(git diff --name-only "$PARENT_DEV".."$MERGE_COMMIT")
-            echo "changed_files<<EOF" >> $GITHUB_ENV
-            echo "$CHANGED_FILES" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-            
-            # Get commit messages for PR description
-            COMMIT_MESSAGES=$(git log --oneline "$PARENT_DEV".."$MERGE_COMMIT")
-            echo "commit_messages<<EOF" >> $GITHUB_ENV
-            echo "$COMMIT_MESSAGES" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-          fi
+          # Get changed files
+          CHANGED_FILES=$(git diff --name-only "$PARENT_DEV" "$MERGE_COMMIT")
+          echo "changed_files<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          # Get commit messages
+          COMMIT_MESSAGES=$(git log --oneline "$PARENT_DEV".."$MERGE_COMMIT")
+          echo "commit_messages<<EOF" >> $GITHUB_ENV
+          echo "$COMMIT_MESSAGES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          # Count commits (merge + feature commits)
+          COMMIT_COUNT=$(git log --oneline "$PARENT_DEV".."$MERGE_COMMIT" | wc -l)
+          echo "commit_count=$COMMIT_COUNT" >> $GITHUB_ENV
           
           echo "parent_commit=$PARENT_DEV" >> $GITHUB_OUTPUT
+          
+          # Create a patch file with the changes
+          git diff "$PARENT_DEV" "$MERGE_COMMIT" --no-prefix > changes.patch
+          
+          if [ ! -s changes.patch ]; then
+            echo "Warning: Patch file is empty, no changes to apply"
+            echo "has_changes=false" >> $GITHUB_ENV
+          else
+            echo "has_changes=true" >> $GITHUB_ENV
+            echo "Created patch file with $(wc -l < changes.patch) lines"
+          fi
 
       - name: Check if changes already in UAT
         run: |
@@ -236,7 +183,7 @@ jobs:
           
           git fetch origin uat
           
-          if git merge-base --is-ancestor "$MERGE_COMMIT" origin/uat 2>/dev/null; then
+          if git merge-base --is-ancestor "$MERGE_COMMIT" origin/uat; then
             echo "Changes from PR already exist in UAT"
             echo "already_in_uat=true" >> $GITHUB_ENV
           else
@@ -249,8 +196,13 @@ jobs:
           echo "Changes already promoted to UAT"
           exit 0
 
+      - name: Stop if no changes
+        if: env.has_changes == 'false'
+        run: |
+          echo "No changes found to promote"
+          exit 0
+
       - name: Create temporary promote branch from uat
-        if: env.commits_found == 'true'
         id: create_branch
         run: |
           PR="${{ github.event.inputs.pr_number }}"
@@ -264,158 +216,106 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "Created branch: $BRANCH"
 
-      - name: Cherry-pick commits onto UAT branch
-        if: env.commits_found == 'true'
-        id: cherry_pick
+      - name: Apply changes using git apply
+        id: apply_changes
         run: |
           BR="${{ steps.create_branch.outputs.branch }}"
           PR="${{ github.event.inputs.pr_number }}"
           
-          echo "Cherry-picking ${{ env.commit_count }} commits from PR #$PR"
+          echo "Applying changes from PR #$PR using git apply"
           
-          IFS=$'\n' read -r -d '' -a COMMITS_ARRAY <<< "${{ env.commits_list }}"
-          SUCCESS_COUNT=0
-          
-          for COMMIT in "${COMMITS_ARRAY[@]}"; do
-            if [ -n "$COMMIT" ]; then
-              COMMIT_MSG=$(git log --format="%s" -n 1 "$COMMIT")
-              echo "Cherry-picking: $COMMIT_MSG ($(echo $COMMIT | cut -c1-7))"
-              if git cherry-pick -x "$COMMIT"; then
-                ((SUCCESS_COUNT++))
-                echo "✓ Success"
-              else
-                echo "✗ Failed to cherry-pick commit: $COMMIT"
-                echo "Attempting conflict resolution..."
-                
-                # Check for conflicts
-                if git status | grep -q "both modified"; then
-                  echo "Conflict detected. Aborting cherry-pick."
-                  git cherry-pick --abort
-                  exit 1
-                else
-                  # Unknown error, try to continue
-                  git cherry-pick --continue || git cherry-pick --abort
-                  exit 1
-                fi
-              fi
+          # Apply the patch
+          if git apply --whitespace=nowarn changes.patch; then
+            echo "✓ Successfully applied changes"
+            
+            # Add all changes
+            git add -A
+            
+            # Create a commit with proper message
+            COMMIT_MSG="Promote PR #$PR (${{ env.jira_id }}) to UAT\n\nIncludes changes from merge commit: ${{ steps.validate.outputs.merge_commit }}\nSource: PR #$PR merged into dev"
+            
+            echo -e "$COMMIT_MSG" | git commit -F -
+            
+            echo "changes_applied=true" >> $GITHUB_OUTPUT
+          else
+            echo "✗ Failed to apply changes with git apply"
+            echo "Trying alternative method with git merge-tree..."
+            
+            # Try alternative: Use git merge-tree to create a merge
+            PARENT_DEV="${{ steps.get-changes.outputs.parent_commit }}"
+            MERGE_COMMIT="${{ steps.validate.outputs.merge_commit }}"
+            
+            # Get the common ancestor
+            COMMON_ANCESTOR=$(git merge-base "$PARENT_DEV" "$MERGE_COMMIT")
+            
+            # Create a temporary branch with the changes
+            git checkout -b temp_apply "$COMMON_ANCESTOR"
+            
+            # Cherry-pick the merge commit (as a regular commit)
+            if git cherry-pick -n "$MERGE_COMMIT"; then
+              echo "✓ Successfully cherry-picked merge commit"
+              
+              # Switch back to our promotion branch and merge
+              git checkout "$BR"
+              git merge --no-ff temp_apply -m "Promote PR #$PR (${{ env.jira_id }}) to UAT"
+              
+              echo "changes_applied=true" >> $GITHUB_OUTPUT
+            else
+              echo "✗ All methods failed to apply changes"
+              echo "changes_applied=false" >> $GITHUB_OUTPUT
+              exit 1
             fi
-          done
-          
-          echo "Successfully cherry-picked $SUCCESS_COUNT commits"
-          echo "cherry_picked_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
-          
-          # Push the branch
-          git push origin "HEAD:$BR"
-          echo "Pushed branch $BR to remote"
+            
+            # Clean up
+            git branch -D temp_apply
+          fi
 
-      - name: Handle squash merge (if no individual commits)
-        if: env.commits_found == 'false'
-        id: squash_merge
+      - name: Push changes if applied successfully
+        if: steps.apply_changes.outputs.changes_applied == 'true'
         run: |
-          echo "Handling as squash merge or single commit..."
+          BR="${{ steps.create_branch.outputs.branch }}"
           
-          PR="${{ github.event.inputs.pr_number }}"
-          JIRA_ID="${{ env.jira_id }}"
-          TS=$(date +%s)
-          BRANCH="promote/${JIRA_ID}-pr${PR}-squash-${TS}"
-          MERGE_COMMIT="${{ steps.validate.outputs.merge_commit }}"
-          PARENT_DEV="${{ steps.get-changes.outputs.parent_commit }}"
-          
-          # Create branch from uat
-          git fetch origin uat
-          git checkout -b "$BRANCH" origin/uat
-          
-          # Apply changes from merge commit
-          echo "Applying changes from merge commit $MERGE_COMMIT"
-          git cherry-pick -n "$MERGE_COMMIT"
-          
-          # Commit with appropriate message
-          COMMIT_MSG="Promote PR #$PR ($JIRA_ID) to UAT - squash merge"
-          git commit -m "$COMMIT_MSG"
-          
-          # Push the branch
-          git push origin "HEAD:$BRANCH"
-          
-          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
-          echo "cherry_picked_count=1" >> $GITHUB_OUTPUT
+          echo "Pushing branch $BR to remote"
+          git push origin "HEAD:$BR"
+          echo "✓ Successfully pushed branch"
 
       - name: Build PR body content
         id: body
         run: |
-          if [ "${{ env.commits_found }}" = "true" ]; then
-            BR="${{ steps.create_branch.outputs.branch }}"
-            PR="${{ github.event.inputs.pr_number }}"
-            JIRA_ID="${{ env.jira_id }}"
-            
-            # Get changed files from our cherry-picked branch
-            FILES=$(git --no-pager diff --name-only origin/uat..origin/"$BR" 2>/dev/null || echo "Could not get file list")
-            FILE_COUNT=$(echo "$FILES" | sed '/^\s*$/d' | wc -l | tr -d ' ')
-            
-            # Get commit messages from our stored list
-            COMMITS_INFO=""
-            IFS=$'\n' read -r -d '' -a COMMITS_ARRAY <<< "${{ env.commits_list }}"
-            for COMMIT in "${COMMITS_ARRAY[@]}"; do
-              if [ -n "$COMMIT" ]; then
-                MSG=$(git log --format="%s" -n 1 "$COMMIT" 2>/dev/null || echo "Unknown commit")
-                COMMITS_INFO="${COMMITS_INFO}- $MSG ($(echo $COMMIT | cut -c1-7))"$'\n'
-              fi
-            done
-
-            echo "Automated Promotion PR (Merge Commit Strategy)" > body.txt
-            echo "" >> body.txt
-            echo "Jira ID: ${JIRA_ID}" >> body.txt
-            echo "Source PR: #$PR (merged into dev)" >> body.txt
-            echo "Dev Merge Commit: ${{ steps.validate.outputs.merge_commit }}" >> body.txt
-            echo "Target branch: uat" >> body.txt
-            echo "" >> body.txt
-            echo "Changes identified: $FILE_COUNT files, ${{ env.commit_count }} commits" >> body.txt
-            echo "Successfully cherry-picked: ${{ steps.cherry_pick.outputs.cherry_picked_count }} commits" >> body.txt
-            echo "" >> body.txt
+          BR="${{ steps.create_branch.outputs.branch }}"
+          PR="${{ github.event.inputs.pr_number }}"
+          JIRA_ID="${{ env.jira_id }}"
+          
+          # Get changed files
+          FILES="${{ env.changed_files }}"
+          FILE_COUNT=$(echo "$FILES" | sed '/^\s*$/d' | wc -l | tr -d ' ')
+          
+          echo "Automated Promotion PR" > body.txt
+          echo "" >> body.txt
+          echo "Jira ID: ${JIRA_ID}" >> body.txt
+          echo "Source PR: #$PR (merged into dev)" >> body.txt
+          echo "Dev Merge Commit: ${{ steps.validate.outputs.merge_commit }}" >> body.txt
+          echo "Target branch: uat" >> body.txt
+          echo "" >> body.txt
+          echo "Changes identified: $FILE_COUNT files" >> body.txt
+          echo "Method: Applied merge commit diff using git apply" >> body.txt
+          echo "" >> body.txt
+          
+          if [ -n "$FILES" ]; then
             echo "Changed files:" >> body.txt
             echo "$FILES" >> body.txt
             echo "" >> body.txt
-            echo "Commit messages (from source PR):" >> body.txt
-            echo "$COMMITS_INFO" >> body.txt
-            echo "" >> body.txt
-            echo "Traceability: All commits have '(cherry picked from commit ...)' annotation" >> body.txt
-          else
-            # For squash merge
-            BR="${{ steps.squash_merge.outputs.branch }}"
-            PR="${{ github.event.inputs.pr_number }}"
-            JIRA_ID="${{ env.jira_id }}"
-            
-            FILES="${{ env.changed_files }}"
-            FILE_COUNT=$(echo "$FILES" | sed '/^\s*$/d' | wc -l | tr -d ' ')
-            
-            echo "Automated Promotion PR (Squash Merge)" > body.txt
-            echo "" >> body.txt
-            echo "Jira ID: ${JIRA_ID}" >> body.txt
-            echo "Source PR: #$PR (merged into dev)" >> body.txt
-            echo "Dev Merge Commit: ${{ steps.validate.outputs.merge_commit }}" >> body.txt
-            echo "Target branch: uat" >> body.txt
-            echo "" >> body.txt
-            echo "Changes identified: $FILE_COUNT files" >> body.txt
-            echo "Merge type: Squash merge (single commit)" >> body.txt
-            echo "" >> body.txt
-            echo "Changed files:" >> body.txt
-            echo "$FILES" >> body.txt
-            echo "" >> body.txt
-            echo "Merge commit message:" >> body.txt
-            echo "${{ env.commit_messages }}" >> body.txt
           fi
           
+          echo "Commit messages from source:" >> body.txt
+          echo "${{ env.commit_messages }}" >> body.txt
           echo "" >> body.txt
           echo "A PR ID reference will be added below for future uat → prod promotions." >> body.txt
 
       - name: Create PR into uat
         id: create_pr
         run: |
-          if [ "${{ env.commits_found }}" = "true" ]; then
-            BR="${{ steps.create_branch.outputs.branch }}"
-          else
-            BR="${{ steps.squash_merge.outputs.branch }}"
-          fi
-          
+          BR="${{ steps.create_branch.outputs.branch }}"
           JIRA_ID="${{ env.jira_id }}"
           TITLE="[${JIRA_ID}] Promote changes from dev to uat (PR #${{ github.event.inputs.pr_number }})"
 
