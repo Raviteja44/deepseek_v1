@@ -207,7 +207,7 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "Created branch: $BRANCH"
 
-      - name: Apply changes using simple cherry-pick
+      - name: Apply changes with better conflict resolution
         id: apply_changes
         run: |
           BR="${{ steps.create_branch.outputs.branch }}"
@@ -226,38 +226,115 @@ jobs:
           echo "Commit details:"
           git show --oneline -s "$FEATURE_COMMIT"
           
-          # Try simple cherry-pick with conflict resolution
+          # Try simple cherry-pick first
           echo "Attempting to cherry-pick commit..."
           if git cherry-pick -x "$FEATURE_COMMIT"; then
             echo "✓ Successfully cherry-picked feature commit"
             echo "changes_applied=true" >> $GITHUB_OUTPUT
+            echo "conflict_resolved=false" >> $GITHUB_OUTPUT
           else
-            echo "✗ Failed to cherry-pick, checking for conflicts..."
+            echo "✗ Failed to cherry-pick, analyzing conflict type..."
             
-            # Check if there are conflicts
-            if [ -f ".git/MERGE_MSG" ]; then
-              echo "Conflicts detected. Trying to resolve by checking out 'theirs'..."
+            # Get detailed conflict information
+            CONFLICTED_FILES=$(git status --porcelain | grep -E '^(UU|AA|DD|AU|UD|UA|DU)' | cut -c4-)
+            
+            if [ -n "$CONFLICTED_FILES" ]; then
+              echo "Conflicts detected in files:"
+              echo "$CONFLICTED_FILES"
               
-              # For conflicts, accept the incoming change (feature branch version)
-              git status --porcelain | grep "^UU" | cut -c4- | while read file; do
-                echo "Resolving conflict in: $file"
-                # Checkout the version from the feature commit
-                git checkout "$FEATURE_COMMIT" -- "$file" 2>/dev/null || echo "Could not resolve $file"
+              # Resolve each conflict based on type
+              RESOLVED=true
+              
+              git status --porcelain | while read line; do
+                STATUS=$(echo "$line" | cut -c1-2)
+                FILE=$(echo "$line" | cut -c4-)
+                
+                echo "Processing: $FILE (status: $STATUS)"
+                
+                case $STATUS in
+                  "UU"|"AA")
+                    # Both modified - use feature branch version
+                    echo "  Both modified conflict - using feature branch version"
+                    git checkout "$FEATURE_COMMIT" -- "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not checkout $FILE from feature commit"
+                      RESOLVED=false
+                    }
+                    git add "$FILE"
+                    ;;
+                  "DD")
+                    # Both deleted - remove file
+                    echo "  Both deleted - removing file"
+                    git rm "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not remove $FILE"
+                      RESOLVED=false
+                    }
+                    ;;
+                  "AU")
+                    # Added by us, deleted by them - keep our addition
+                    echo "  File added by us, deleted by them - keeping addition"
+                    # Do nothing, keep our version
+                    git add "$FILE"
+                    ;;
+                  "UD")
+                    # Modified by us, deleted by them - delete file
+                    echo "  File modified by us, deleted by them - deleting file"
+                    git rm "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not remove $FILE"
+                      RESOLVED=false
+                    }
+                    ;;
+                  "UA")
+                    # Deleted by us, added by them - add their version
+                    echo "  File deleted by us, added by them - adding their version"
+                    git checkout "$FEATURE_COMMIT" -- "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not checkout $FILE from feature commit"
+                      RESOLVED=false
+                    }
+                    git add "$FILE"
+                    ;;
+                  "DU")
+                    # Deleted by us, modified by them - SPECIAL CASE: modify/delete conflict
+                    # Since UAT is the target and we're promoting from dev, we should
+                    # accept the modification from dev (feature branch)
+                    echo "  File deleted in UAT, modified in dev - adding modification from dev"
+                    git checkout "$FEATURE_COMMIT" -- "$FILE" 2>/dev/null || {
+                      echo "  Warning: Could not checkout $FILE from feature commit"
+                      RESOLVED=false
+                    }
+                    git add "$FILE"
+                    ;;
+                  *)
+                    echo "  Unknown conflict status: $STATUS"
+                    RESOLVED=false
+                    ;;
+                esac
               done
               
-              # Continue the cherry-pick
-              if git cherry-pick --continue; then
-                echo "✓ Successfully resolved conflicts and completed cherry-pick"
-                echo "changes_applied=true" >> $GITHUB_OUTPUT
+              if [ "$RESOLVED" = "true" ]; then
+                echo "All conflicts resolved, continuing cherry-pick..."
+                if git cherry-pick --continue; then
+                  echo "✓ Successfully resolved conflicts and completed cherry-pick"
+                  echo "changes_applied=true" >> $GITHUB_OUTPUT
+                  echo "conflict_resolved=true" >> $GITHUB_OUTPUT
+                else
+                  echo "✗ Could not continue after conflict resolution"
+                  git cherry-pick --abort
+                  echo "changes_applied=false" >> $GITHUB_OUTPUT
+                  echo "conflict_resolved=false" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
               else
-                echo "✗ Could not resolve conflicts, aborting"
+                echo "✗ Could not resolve all conflicts, aborting"
                 git cherry-pick --abort
                 echo "changes_applied=false" >> $GITHUB_OUTPUT
+                echo "conflict_resolved=false" >> $GITHUB_OUTPUT
                 exit 1
               fi
             else
-              echo "✗ Unknown error during cherry-pick"
+              echo "✗ No conflict markers found, unknown error"
+              git cherry-pick --abort
               echo "changes_applied=false" >> $GITHUB_OUTPUT
+              echo "conflict_resolved=false" >> $GITHUB_OUTPUT
               exit 1
             fi
           fi
@@ -304,6 +381,7 @@ jobs:
           PR="${{ github.event.inputs.pr_number }}"
           JIRA_ID="${{ env.jira_id }}"
           BR="${{ steps.create_branch.outputs.branch }}"
+          CONFLICT_RESOLVED="${{ steps.apply_changes.outputs.conflict_resolved }}"
           
           # Get changed files from our branch
           git fetch origin uat
@@ -318,6 +396,11 @@ jobs:
           echo "Feature Commit Applied: ${{ steps.get-changes.outputs.feature_commit }}" >> body.txt
           echo "Target branch: uat" >> body.txt
           echo "Promotion branch: $BR" >> body.txt
+          
+          if [ "$CONFLICT_RESOLVED" = "true" ]; then
+            echo "Note: Conflicts were automatically resolved during cherry-pick" >> body.txt
+          fi
+          
           echo "" >> body.txt
           echo "Changes identified: $FILE_COUNT files" >> body.txt
           echo "" >> body.txt
@@ -370,9 +453,6 @@ jobs:
             --arg body "$(cat body.txt)" \
             '{title:$title, head:$head, base:$base, body:$body}')
           
-          echo "Payload:"
-          echo "$PAYLOAD" | jq .
-          
           RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
@@ -385,10 +465,6 @@ jobs:
           RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
           
           echo "Response HTTP Code: $HTTP_CODE"
-          echo "Response Body:"
-          echo "$RESPONSE_BODY" | jq . 2>/dev/null || echo "$RESPONSE_BODY"
-          
-          echo "$RESPONSE_BODY" > created.json
           
           if [ "$HTTP_CODE" != "201" ]; then
             echo "Error creating PR. HTTP Code: $HTTP_CODE"
@@ -396,6 +472,8 @@ jobs:
             echo "Error message: $ERROR_MSG"
             exit 1
           fi
+          
+          echo "$RESPONSE_BODY" > created.json
           
           PR_NUM=$(echo "$RESPONSE_BODY" | jq -r '.number')
           echo "created_pr=$PR_NUM" >> $GITHUB_OUTPUT
