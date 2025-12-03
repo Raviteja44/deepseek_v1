@@ -109,6 +109,14 @@ jobs:
           echo "commit_messages<<EOF" >> $GITHUB_ENV
           git log --oneline "$PARENT_DEV".."${{ steps.validate.outputs.merge_commit }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
+          
+          # Get changed files
+          CHANGED_FILES=$(git diff --name-only "$PARENT_DEV" "${{ steps.validate.outputs.merge_commit }}")
+          FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          echo "changed_files<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
       - name: Check if changes already in UAT
         run: |
@@ -161,10 +169,35 @@ jobs:
             CONFLICT_NOTE="Note: Conflicts were automatically resolved during cherry-pick"
           fi
           
-          # Create PR body content
-          BODY_CONTENT="Automated Promotion PR\n\nJira ID: ${{ env.jira_id }}\nSource PR: #${{ steps.validate.outputs.pr_number }} (merged into dev)\nDev Merge Commit: ${{ steps.validate.outputs.merge_commit }}\nFeature Commit Applied: ${{ steps.get-changes.outputs.feature_commit }}\nTarget branch: uat\nPromotion branch: $BR\n$CONFLICT_NOTE\n\nCommit messages from source:\n${{ env.commit_messages }}\n\nA PR ID reference will be added below for future uat → prod promotions."
+          # Build the PR body with proper formatting
+          {
+            echo "Automated Promotion PR"
+            echo ""
+            echo "Jira ID: ${{ env.jira_id }}"
+            echo "Source PR: #${{ steps.validate.outputs.pr_number }} (merged into dev)"
+            echo "Dev Merge Commit: ${{ steps.validate.outputs.merge_commit }}"
+            echo "Feature Commit Applied: ${{ steps.get-changes.outputs.feature_commit }}"
+            echo "Target branch: uat"
+            echo "Promotion branch: $BR"
+            if [ -n "$CONFLICT_NOTE" ]; then
+              echo "$CONFLICT_NOTE"
+            fi
+            echo ""
+            echo "Changes identified: ${{ steps.get-changes.outputs.file_count }} files"
+            echo ""
+            if [ -n "${{ env.changed_files }}" ]; then
+              echo "Changed files:"
+              echo "${{ env.changed_files }}"
+              echo ""
+            fi
+            echo "Commit messages from source:"
+            echo "${{ env.commit_messages }}"
+            echo ""
+            echo "A PR ID reference will be added below for future uat → prod promotions."
+          } > pr_body.txt
           
-          echo "$BODY_CONTENT" > pr_body.txt
+          # Store body content for later use
+          BODY_CONTENT=$(cat pr_body.txt)
           echo "body_content<<EOF" >> $GITHUB_ENV
           echo "$BODY_CONTENT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
@@ -209,8 +242,14 @@ jobs:
           echo "created_pr=$PR_NUM" >> $GITHUB_OUTPUT
           
           # Update PR with ID
-          UPDATED_BODY="$BODY_CONTENT\n\nUAT PR ID: ${PR_NUM}\nRetain this ID for uat → prod promotions."
-          UPDATE_PAYLOAD=$(jq -n --arg body "$UPDATED_BODY" '{body: $body}')
+          {
+            echo "$BODY_CONTENT"
+            echo ""
+            echo "UAT PR ID: $PR_NUM"
+            echo "Retain this ID for uat → prod promotions."
+          } > updated_body.txt
+          
+          UPDATE_PAYLOAD=$(jq -n --arg body "$(cat updated_body.txt)" '{body: $body}')
           
           curl -s -X PATCH \
             -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
