@@ -1,4 +1,4 @@
-name: 2. Promote Dev → UAT
+name: 3. Promote Dev → UAT
 
 on:
   workflow_dispatch:
@@ -168,25 +168,11 @@ jobs:
           echo "parent_commit=$PARENT_DEV" >> $GITHUB_OUTPUT
           echo "feature_parent=$FEATURE_PARENT" >> $GITHUB_OUTPUT
           
-          # Create a better patch file - get diff between dev parent and feature parent
-          # This gets the actual changes from the feature branch
-          git diff "$PARENT_DEV" "$FEATURE_PARENT" > changes.patch
+          # Get the actual feature commit (non-merge commit)
+          FEATURE_COMMIT=$(git log --no-merges --pretty=format:"%H" "$PARENT_DEV".."$MERGE_COMMIT" | head -1)
+          echo "feature_commit=$FEATURE_COMMIT" >> $GITHUB_OUTPUT
           
-          if [ ! -s changes.patch ]; then
-            echo "Warning: Patch file is empty, trying alternative diff method"
-            # Try diff between dev parent and merge commit
-            git diff "$PARENT_DEV" "$MERGE_COMMIT" > changes.patch
-          fi
-          
-          if [ ! -s changes.patch ]; then
-            echo "Warning: Patch file is still empty, no changes to apply"
-            echo "has_changes=false" >> $GITHUB_ENV
-          else
-            echo "has_changes=true" >> $GITHUB_ENV
-            echo "Created patch file with $(wc -l < changes.patch) lines"
-            echo "Patch file preview (first 10 lines):"
-            head -10 changes.patch
-          fi
+          echo "Feature commit to apply: $FEATURE_COMMIT"
 
       - name: Check if changes already in UAT
         run: |
@@ -207,12 +193,6 @@ jobs:
           echo "Changes already promoted to UAT"
           exit 0
 
-      - name: Stop if no changes
-        if: env.has_changes == 'false'
-        run: |
-          echo "No changes found to promote"
-          exit 0
-
       - name: Create temporary promote branch from uat
         id: create_branch
         run: |
@@ -227,163 +207,122 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "Created branch: $BRANCH"
 
-      - name: Apply changes using simpler method
+      - name: Apply changes using simple cherry-pick
         id: apply_changes
         run: |
           BR="${{ steps.create_branch.outputs.branch }}"
           PR="${{ github.event.inputs.pr_number }}"
-          PARENT_DEV="${{ steps.get-changes.outputs.parent_commit }}"
-          FEATURE_PARENT="${{ steps.get-changes.outputs.feature_parent }}"
-          MERGE_COMMIT="${{ steps.validate.outputs.merge_commit }}"
+          FEATURE_COMMIT="${{ steps.get-changes.outputs.feature_commit }}"
           
           echo "Applying changes from PR #$PR"
-          echo "Method 1: Using git checkout to get files from feature branch"
+          echo "Feature commit to apply: $FEATURE_COMMIT"
           
-          # Method 1: Checkout files from feature branch
-          if [ -n "$FEATURE_PARENT" ]; then
-            echo "Checking out files from feature branch commit: $FEATURE_PARENT"
-            
-            # Get list of changed files
-            FILES_TO_COPY=$(git diff --name-only "$PARENT_DEV" "$FEATURE_PARENT")
-            
-            if [ -n "$FILES_TO_COPY" ]; then
-              echo "Files to copy:"
-              echo "$FILES_TO_COPY"
-              
-              # Copy each file from feature branch
-              for FILE in $FILES_TO_COPY; do
-                echo "Copying: $FILE"
-                git checkout "$FEATURE_PARENT" -- "$FILE" 2>/dev/null || echo "Could not checkout $FILE"
-              done
-              
-              # Check if we have any changes
-              if git status --porcelain | grep -q "."; then
-                echo "✓ Successfully copied files from feature branch"
-                
-                # Add all changes
-                git add -A
-                
-                # Create a commit with proper message
-                COMMIT_MSG="Promote PR #$PR (${{ env.jira_id }}) to UAT
-                
-                Includes changes from PR #$PR merged into dev
-                Merge commit: $MERGE_COMMIT
-                Feature branch: $FEATURE_PARENT"
-                
-                echo "$COMMIT_MSG" | git commit -F -
-                
-                echo "changes_applied=true" >> $GITHUB_OUTPUT
-                echo "method=checkout" >> $GITHUB_OUTPUT
-              else
-                echo "No changes were applied"
-                echo "changes_applied=false" >> $GITHUB_OUTPUT
-              fi
-            else
-              echo "No files to copy"
-              echo "changes_applied=false" >> $GITHUB_OUTPUT
-            fi
+          if [ -z "$FEATURE_COMMIT" ]; then
+            echo "Error: No feature commit found to apply"
+            exit 1
+          fi
+          
+          # Show what we're trying to cherry-pick
+          echo "Commit details:"
+          git show --oneline -s "$FEATURE_COMMIT"
+          
+          # Try simple cherry-pick with conflict resolution
+          echo "Attempting to cherry-pick commit..."
+          if git cherry-pick -x "$FEATURE_COMMIT"; then
+            echo "✓ Successfully cherry-picked feature commit"
+            echo "changes_applied=true" >> $GITHUB_OUTPUT
           else
-            echo "No feature parent found, trying alternative method"
-            echo "changes_applied=false" >> $GITHUB_OUTPUT
-          fi
-          
-          # Method 2: If first method failed, try using git format-patch
-          if [ "${{ steps.apply_changes.outputs.changes_applied }}" != "true" ]; then
-            echo "Method 2: Using git format-patch"
+            echo "✗ Failed to cherry-pick, checking for conflicts..."
             
-            # Create patches for individual commits
-            git format-patch "$PARENT_DEV".."$MERGE_COMMIT" --stdout > commits.patch
-            
-            if [ -s commits.patch ]; then
-              echo "Applying patches..."
-              if git am --whitespace=nowarn < commits.patch; then
-                echo "✓ Successfully applied patches"
-                
-                # Update commit message to be more descriptive
-                git commit --amend -m "Promote PR #$PR (${{ env.jira_id }}) to UAT" -m "Includes changes from PR #$PR merged into dev" -m "Merge commit: $MERGE_COMMIT"
-                
-                echo "changes_applied=true" >> $GITHUB_OUTPUT
-                echo "method=format-patch" >> $GITHUB_OUTPUT
-              else
-                echo "✗ Failed to apply patches with git am"
-                echo "changes_applied=false" >> $GITHUB_OUTPUT
-              fi
-            else
-              echo "No patches generated"
-              echo "changes_applied=false" >> $GITHUB_OUTPUT
-            fi
-          fi
-          
-          # Method 3: If still failed, use simple cherry-pick of feature commits
-          if [ "${{ steps.apply_changes.outputs.changes_applied }}" != "true" ]; then
-            echo "Method 3: Cherry-picking feature commits individually"
-            
-            # Get commits from feature branch (excluding merge commit)
-            FEATURE_COMMITS=$(git log --no-merges --pretty=format:"%H" "$PARENT_DEV".."$MERGE_COMMIT")
-            
-            if [ -n "$FEATURE_COMMITS" ]; then
-              echo "Found feature commits to cherry-pick:"
-              echo "$FEATURE_COMMITS"
+            # Check if there are conflicts
+            if [ -f ".git/MERGE_MSG" ]; then
+              echo "Conflicts detected. Trying to resolve by checking out 'theirs'..."
               
-              SUCCESS=true
-              for COMMIT in $FEATURE_COMMITS; do
-                echo "Cherry-picking: $(git log --oneline -n 1 $COMMIT)"
-                if ! git cherry-pick -x "$COMMIT"; then
-                  echo "Failed to cherry-pick $COMMIT"
-                  git cherry-pick --abort
-                  SUCCESS=false
-                  break
-                fi
+              # For conflicts, accept the incoming change (feature branch version)
+              git status --porcelain | grep "^UU" | cut -c4- | while read file; do
+                echo "Resolving conflict in: $file"
+                # Checkout the version from the feature commit
+                git checkout "$FEATURE_COMMIT" -- "$file" 2>/dev/null || echo "Could not resolve $file"
               done
               
-              if [ "$SUCCESS" = "true" ]; then
-                echo "✓ Successfully cherry-picked all feature commits"
+              # Continue the cherry-pick
+              if git cherry-pick --continue; then
+                echo "✓ Successfully resolved conflicts and completed cherry-pick"
                 echo "changes_applied=true" >> $GITHUB_OUTPUT
-                echo "method=cherry-pick" >> $GITHUB_OUTPUT
               else
-                echo "✗ Failed to cherry-pick feature commits"
+                echo "✗ Could not resolve conflicts, aborting"
+                git cherry-pick --abort
                 echo "changes_applied=false" >> $GITHUB_OUTPUT
+                exit 1
               fi
             else
-              echo "No feature commits found"
+              echo "✗ Unknown error during cherry-pick"
               echo "changes_applied=false" >> $GITHUB_OUTPUT
+              exit 1
             fi
           fi
 
-      - name: Push changes if applied successfully
+      - name: Verify and push changes
         if: steps.apply_changes.outputs.changes_applied == 'true'
         run: |
           BR="${{ steps.create_branch.outputs.branch }}"
           
-          echo "Pushing branch $BR to remote"
-          git push origin "HEAD:$BR"
-          echo "✓ Successfully pushed branch"
+          echo "Current branch: $(git branch --show-current)"
+          echo "Checking git status:"
+          git status --porcelain
+          
+          echo "Latest commit:"
+          git log --oneline -1
+          
+          echo "Pushing branch $BR to remote..."
+          if git push origin "HEAD:$BR"; then
+            echo "✓ Successfully pushed branch $BR"
+            
+            # Verify the branch exists on remote
+            echo "Verifying remote branch..."
+            git fetch origin
+            if git show-ref --verify "refs/remotes/origin/$BR" > /dev/null 2>&1; then
+              echo "✓ Remote branch confirmed: origin/$BR"
+            else
+              echo "✗ Remote branch not found after push"
+              exit 1
+            fi
+          else
+            echo "✗ Failed to push branch $BR"
+            echo "Trying with force push..."
+            if git push --force origin "HEAD:$BR"; then
+              echo "✓ Successfully force-pushed branch $BR"
+            else
+              echo "✗ Force push also failed"
+              exit 1
+            fi
+          fi
 
       - name: Build PR body content
         id: body
         run: |
-          BR="${{ steps.create_branch.outputs.branch }}"
           PR="${{ github.event.inputs.pr_number }}"
           JIRA_ID="${{ env.jira_id }}"
+          BR="${{ steps.create_branch.outputs.branch }}"
           
-          # Get changed files
-          FILES="${{ env.changed_files }}"
+          # Get changed files from our branch
+          git fetch origin uat
+          FILES=$(git diff --name-only origin/uat.."$BR" 2>/dev/null || echo "Could not get diff")
           FILE_COUNT=$(echo "$FILES" | sed '/^\s*$/d' | wc -l | tr -d ' ')
-          
-          METHOD="${{ steps.apply_changes.outputs.method }}"
           
           echo "Automated Promotion PR" > body.txt
           echo "" >> body.txt
           echo "Jira ID: ${JIRA_ID}" >> body.txt
           echo "Source PR: #$PR (merged into dev)" >> body.txt
           echo "Dev Merge Commit: ${{ steps.validate.outputs.merge_commit }}" >> body.txt
+          echo "Feature Commit Applied: ${{ steps.get-changes.outputs.feature_commit }}" >> body.txt
           echo "Target branch: uat" >> body.txt
-          echo "Application method: $METHOD" >> body.txt
+          echo "Promotion branch: $BR" >> body.txt
           echo "" >> body.txt
           echo "Changes identified: $FILE_COUNT files" >> body.txt
           echo "" >> body.txt
           
-          if [ -n "$FILES" ]; then
+          if [ -n "$FILES" ] && [ "$FILES" != "Could not get diff" ]; then
             echo "Changed files:" >> body.txt
             echo "$FILES" >> body.txt
             echo "" >> body.txt
@@ -401,27 +340,64 @@ jobs:
           JIRA_ID="${{ env.jira_id }}"
           TITLE="[${JIRA_ID}] Promote changes from dev to uat (PR #${{ github.event.inputs.pr_number }})"
 
+          echo "Creating PR with:"
+          echo "Title: $TITLE"
+          echo "Head: $BR"
+          echo "Base: uat"
+          
+          # First, verify the branch exists
+          echo "Verifying branch $BR exists on remote..."
+          BRANCH_EXISTS=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/branches/$BR" \
+            | jq -r '.name // empty')
+          
+          if [ -z "$BRANCH_EXISTS" ]; then
+            echo "Error: Branch $BR does not exist on remote!"
+            echo "Available branches:"
+            git branch -r
+            exit 1
+          fi
+          
+          echo "Branch $BR confirmed on remote"
+          
+          # Create PR with detailed error handling
           PAYLOAD=$(jq -n \
             --arg title "$TITLE" \
             --arg head "$BR" \
             --arg base "uat" \
             --arg body "$(cat body.txt)" \
             '{title:$title, head:$head, base:$base, body:$body}')
-
-          RESPONSE=$(curl -s -X POST \
+          
+          echo "Payload:"
+          echo "$PAYLOAD" | jq .
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             "https://api.github.com/repos/${{ github.repository }}/pulls")
-
-          echo "$RESPONSE" > created.json
-
-          PR_NUM=$(jq -r '.number' created.json)
-          if [ "$PR_NUM" = "null" ]; then
-            echo "Error creating PR: $(jq -r '.message' created.json)" >&2
+          
+          # Split response and status code
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "Response HTTP Code: $HTTP_CODE"
+          echo "Response Body:"
+          echo "$RESPONSE_BODY" | jq . 2>/dev/null || echo "$RESPONSE_BODY"
+          
+          echo "$RESPONSE_BODY" > created.json
+          
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "Error creating PR. HTTP Code: $HTTP_CODE"
+            ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.message // .errors[0].message // "Unknown error"' 2>/dev/null || echo "Unknown error")
+            echo "Error message: $ERROR_MSG"
             exit 1
           fi
-
+          
+          PR_NUM=$(echo "$RESPONSE_BODY" | jq -r '.number')
           echo "created_pr=$PR_NUM" >> $GITHUB_OUTPUT
           echo "Created PR #$PR_NUM"
 
