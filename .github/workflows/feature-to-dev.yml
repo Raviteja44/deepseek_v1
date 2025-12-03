@@ -32,24 +32,31 @@ jobs:
         run: |
           git fetch origin ${{ github.event.inputs.feature_branch }}
 
+      - name: Branch Sync Pre-Check
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+          if ! git merge-base --is-ancestor origin/dev origin/$FEATURE; then
+            echo "Feature branch not is not up to date with latest dev branch."
+            echo "Fetch latest dev branch into your feature branch and push the changes."
+            exit 1
+          fi
+          echo "Feature branch is up to date with dev."
+
       - name: Extract Jira ID
         id: jira
         run: |
           FEATURE="${{ github.event.inputs.feature_branch }}"
           JIRA_ID=$(echo "$FEATURE" | grep -oE "JIRA-[0-9]+")
-          
           if [ -z "$JIRA_ID" ]; then
             echo "Jira ID not found in branch name. Ensure branch contains pattern JIRA-123."
             exit 1
           fi
-
           echo "jira_id=$JIRA_ID" >> $GITHUB_ENV
 
       - name: Check for differences
         id: diffcheck
         run: |
           FEATURE="${{ github.event.inputs.feature_branch }}"
-
           if git diff --quiet origin/dev origin/$FEATURE; then
             echo "has_diff=false" >> $GITHUB_ENV
           else
@@ -66,11 +73,8 @@ jobs:
         id: prepare
         run: |
           FEATURE="${{ github.event.inputs.feature_branch }}"
-
           FILES=$(git diff --name-only origin/dev origin/$FEATURE)
-          FILE_COUNT=$(echo "$FILES" | wc -l || true)
-
-          COMMITS=$(git log origin/dev..origin/$FEATURE --pretty=format:"- %s (%h)" || true)
+          COMMITS=$(git log origin.dev..origin/$FEATURE --pretty=format:"- %s (%h)" || true)
 
           echo "FILES<<EOF" >> $GITHUB_ENV
           echo "$FILES" >> $GITHUB_ENV
@@ -121,7 +125,7 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> $GITHUB_ENV
           echo "Created PR #$PR_NUMBER"
 
-      - name: Update PR Body With PR ID (using PAT)
+      - name: Update PR Body With PR ID
         run: |
           PR_NUM="${{ env.pr_number }}"
           BODY_FILE="updated_body.txt"
@@ -145,7 +149,6 @@ jobs:
         run: |
           PR_NUM="${{ env.pr_number }}"
           JIRA_ID="${{ env.jira_id }}"
-
           LABELS=$(jq -n --arg jira "$JIRA_ID" '{labels: [$jira, "feature-to-dev"]}')
 
           curl -s -X POST \
